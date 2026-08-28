@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>モノガタリ みんなの判断</title>
+  <!--
+    モノガタリ投票結果LIFF（⑧静的ホスト分離版・2026-08-03／⑩ティザー表示改修・2026-08-25）
+    正本: blua_ai/20_projects/misawa_home/saitama_gunma/honmaru_pj/line_design/liff_vote/
+
+    位置づけ：GASが匿名公開Webアプリに強制挿入する「Google Apps Scriptで作成」バナーを
+    読者に見せないため、表示面だけをこの静的HTMLへ分離した（記録・集計はGASのまま）。
+    LIFFのエンドポイントURLを gas/Code.gs の /exec URL からこのファイルの公開URLへ差し替えて使う。
+
+    ⑩ 2026-08-25 改修（Dice-K裁定・第三案）：
+      バックナンバー未読の読者が、他話の％結果を投票前に見てしまう問題への対処。
+      投票5原則③「結果が判明する前に判断してもらう」を守るため、
+      来訪話（?ep=）だけ％バーで見せ、それ以外はティザーカード（％非表示）にする。
+      GAS側の記録ロジック・COUNTS・doGetには一切触っていない＝表示層のみの改修。
+      （GASは変わらず全話の集計値をJSONで返す。teaser化はこのファイル内でのクライアント
+       描画の出し分けであり、通信量やAPIレスポンスの中身は変えていない）
+
+    データの流れ：
+      1) このページを開いたURLのクエリ（?ep=S01E01&slot=A 等）を解決する
+         （LIFFがliff.stateにエンコードして渡すケースにも対応＝Code.gsのresolveParams_と同じロジック）
+      2) GAS_ENDPOINT へ同じクエリ＋format=json を付けてfetch（記録はGAS側のdoGetがこれまでどおり実施）
+      3) fetchがCORSでブロックされた場合は自動的にJSONP（<script src>読み込み）にフォールバック
+      4) 受け取った model（episodes/choices/pct/you）を、来訪話=結果カード／それ以外=ティザーカード
+         の出し分けで描画する。件数（回答N件）は表示しない（⑨・従来どおり）
+
+    LIFF SDK（v1ではuserId未使用のため読み込み不要。厳密1人1票の段階で有効化・gas/index.htmlと同方針）
+    <script charset="utf-8" src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+  -->
+  <style>
+    :root {
+      --navy: #1b2a4a;      /* 深紺＝作品トーン（氷上の夜） */
+      --ice: #eef3f8;       /* 氷白 */
+      --accent: #c9a86a;    /* 落ち着いた金 */
+      --bar-you: #2f6db3;   /* あなたの判断 */
+      --bar: #9db4cc;       /* みんな */
+      --text: #24303f;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Hiragino Kaku Gothic ProN", "Hiragino Sans", "Yu Gothic", sans-serif;
+      background: var(--ice); color: var(--text);
+      padding: 20px 16px 32px; max-width: 480px; margin: 0 auto;
+      -webkit-font-smoothing: antialiased;
+    }
+    header { text-align: center; margin-bottom: 20px; }
+    header .brand { font-size: 11px; letter-spacing: .25em; color: var(--navy); opacity: .7; }
+    header h1 { font-size: 18px; color: var(--navy); margin-top: 6px; font-weight: 600; letter-spacing: .08em; }
+    header .rule { width: 40px; height: 2px; background: var(--accent); margin: 10px auto 0; }
+
+    .card {
+      background: #fff; border-radius: 12px; padding: 18px 16px; margin-bottom: 14px;
+      box-shadow: 0 1px 4px rgba(27,42,74,.08);
+    }
+    .card h2 { font-size: 14px; color: var(--navy); margin-bottom: 12px; letter-spacing: .05em; }
+    .row { margin-bottom: 12px; }
+    .row:last-child { margin-bottom: 0; }
+    .row .labels { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 5px; }
+    .row .labels .pct { font-weight: 700; color: var(--navy); }
+    .row .track { background: var(--ice); border-radius: 6px; height: 22px; overflow: hidden; }
+    .row .fill {
+      height: 100%; border-radius: 6px; background: var(--bar);
+      transition: width .8s ease; min-width: 2px;
+    }
+    .row.you .fill { background: var(--bar-you); }
+    .row.you .labels .name::after {
+      content: " ─ あなたの判断"; color: var(--bar-you); font-size: 11px; font-weight: 600;
+    }
+    .none { font-size: 13px; color: #7a8a9c; }
+    .empty { text-align: center; color: #7a8a9c; font-size: 13px; padding: 40px 0; }
+    .retry {
+      display: block; margin: 14px auto 0; padding: 8px 18px; border-radius: 20px;
+      border: 1px solid var(--navy); background: #fff; color: var(--navy); font-size: 12px; cursor: pointer;
+    }
+
+    /* ⑩ ティザーカード：既存 .card を流用し、％バーの代わりに問い一行だけを出す */
+    .card.teaser .teaser-q { font-size: 13px; color: var(--text); line-height: 1.7; }
+    .card.teaser .teaser-q .qlabel {
+      display: inline-block; margin: 2px 4px 0 0; font-size: 10px; letter-spacing: .1em;
+      color: var(--accent); font-weight: 700; vertical-align: middle;
+    }
+
+    /* ⑩ 下部CTA（バックナンバー導線）。.note とは独立の常設行として付与 */
+    .cta {
+      text-align: center; font-size: 12px; color: var(--navy); font-weight: 600;
+      margin-top: 20px; padding-top: 14px; border-top: 1px solid rgba(27,42,74,.12);
+    }
+
+    .note { font-size: 11px; color: #7a8a9c; text-align: center; margin-top: 18px; line-height: 1.7; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">MONOGATARI</div>
+    <h1>あなたと、みんなの判断</h1>
+    <div class="rule"></div>
+  </header>
+
+  <div id="app"><div class="empty">読み込み中…</div></div>
+  <div class="note" id="note"></div>
+  <div class="cta" id="cta"></div>
+
+  <script>
+    // ============================================================
+    // 設定：実デプロイ時に本番の GAS /exec URL へ差し替えること。
+    // 値は ~/.local/blua-liff-vote/env（repo外・非コミット）を参照。
+    // このファイル自体には実URLを書かない運用を踏襲する（readme.md §6-1の既存方針）。
+    // ============================================================
+    var GAS_ENDPOINT = "https://script.google.com/macros/s/AKfycbynQkm7NCr78bzt5QJwrWjVpFdfPw90ELZT2ouy3VZbdUi0PlwtY0v9GPFm68Vha6_3lw/exec";
+
+    // ---- ①URLパラメータの解決（Code.gs resolveParams_ と同一ロジックのJS移植） ----
+    function resolveParams() {
+      var p = {};
+      var qs = location.search.replace(/^\?/, '');
+      qs.split('&').forEach(function (pair) {
+        if (!pair) return;
+        var eq = pair.indexOf('=');
+        var key = decodeURIComponent((eq >= 0 ? pair.slice(0, eq) : pair).replace(/\+/g, ' '));
+        var val = eq >= 0 ? decodeURIComponent(pair.slice(eq + 1).replace(/\+/g, ' ')) : '';
+        p[key] = val;
+      });
+      var st = p['liff.state'];
+      if (st && (!p.ep || !p.choice)) {
+        try {
+          var q = String(st);
+          var qi = q.indexOf('?');
+          q = qi >= 0 ? q.slice(qi + 1) : q.replace(/^[\/#]+/, '');
+          q.split('&').forEach(function (pair) {
+            if (!pair) return;
+            var eq = pair.indexOf('=');
+            var key = decodeURIComponent(eq >= 0 ? pair.slice(0, eq) : pair);
+            var val = eq >= 0 ? decodeURIComponent(pair.slice(eq + 1)) : '';
+            if (!(key in p)) p[key] = val;
+          });
+        } catch (err) { /* 展開失敗時は素のparamのまま続行 */ }
+      }
+      return p;
+    }
+
+    // ---- ②GAS呼び出しURLの組み立て ----
+    function buildApiUrl(params, format, callback) {
+      var parts = [];
+      // slot=A/B が v3 の本線。choice は v2 互換（ロールバック用）。両方そのまま中継する。
+      ['ep', 'slot', 'choice', 'view', 'test'].forEach(function (k) {
+        if (params[k] !== undefined && params[k] !== '') {
+          parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(params[k]));
+        }
+      });
+      parts.push('format=' + format);
+      if (callback) parts.push('callback=' + encodeURIComponent(callback));
+      var sep = GAS_ENDPOINT.indexOf('?') >= 0 ? '&' : '?';
+      return GAS_ENDPOINT + sep + parts.join('&');
+    }
+
+    // ---- ③一段目：fetch(mode:'cors')＋6秒タイムアウト ----
+    // タイムアウト必須の理由（2026-08-04実機で判明）：DNS不調やWebViewの無言ブロックでは
+    // fetchがrejectすらせず永久penddingになる＝「読み込み中」で固まる。打ち切ってJSONPへ落とす。
+    function fetchViaCors(params) {
+      var ctrl = new AbortController();
+      var timer = setTimeout(function () { ctrl.abort(); }, 6000);
+      return fetch(buildApiUrl(params, 'json'), { method: 'GET', mode: 'cors', credentials: 'omit', signal: ctrl.signal })
+        .then(function (res) {
+          clearTimeout(timer);
+          if (!res.ok) throw new Error('http ' + res.status);
+          return res.json();
+        }, function (err) { clearTimeout(timer); throw err; });
+    }
+
+    // ---- ④二段目：JSONPフォールバック（<script src>はCORSの対象外） ----
+    function fetchViaJsonp(params) {
+      return new Promise(function (resolve, reject) {
+        var cb = '__voteCb' + Date.now() + Math.floor(Math.random() * 1000);
+        var timer = setTimeout(function () { cleanup(); reject(new Error('jsonp timeout')); }, 8000);
+        function cleanup() {
+          clearTimeout(timer);
+          try { delete window[cb]; } catch (e) { window[cb] = undefined; }
+          if (script.parentNode) script.parentNode.removeChild(script);
+        }
+        window[cb] = function (data) { cleanup(); resolve(data); };
+        var script = document.createElement('script');
+        script.src = buildApiUrl(params, 'jsonp', cb);
+        script.onerror = function () { cleanup(); reject(new Error('jsonp script error')); };
+        document.head.appendChild(script);
+      });
+    }
+
+    function loadModel(params) {
+      return fetchViaCors(params).catch(function (err) {
+        console.warn('[liff_vote] CORS fetch failed, falling back to JSONP:', err);
+        return fetchViaJsonp(params);
+      });
+    }
+
+    // ---- ⑤描画（件数=回答N件は出さない＝⑨反映済み） ----
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+      });
+    }
+
+    // ⑩ 結果カード（％バー・従来どおり）＝来訪話にだけ使う
+    function resultCardHtml(ep) {
+      if (ep.none) {
+        return '<div class="card"><h2>' + escapeHtml(ep.title) + '</h2>' +
+          '<div class="none">この回はアンケートはありませんでした</div></div>';
+      }
+      var rows = (ep.choices || []).map(function (c) {
+        return '<div class="row ' + (c.you ? 'you' : '') + '">' +
+          '<div class="labels"><span class="name">' + escapeHtml(c.label) + '</span>' +
+          '<span class="pct">' + c.pct + '%</span></div>' +
+          '<div class="track"><div class="fill" style="width:' + c.pct + '%"></div></div></div>';
+      }).join('');
+      // ⑨：回答件数（ep.total）は意図的に描画しない（小母数を見せない設計）
+      return '<div class="card"><h2>' + escapeHtml(ep.title) + '</h2>' + rows + '</div>';
+    }
+
+    // ⑩ ティザーカード（％・バー・票数は一切出さない）＝来訪話以外に使う
+    // 問いの一行は META 由来の選択肢ラベルから機械的に組み立てる（GASからの新規データは不要）。
+    function teaserCardHtml(ep) {
+      if (ep.none) {
+        // アンケートなしの回はもともと％非表示＝そのまま結果カードの表現を流用してよい
+        return resultCardHtml(ep);
+      }
+      var labels = (ep.choices || []).map(function (c) { return c.label; });
+      var question = labels.length
+        ? 'あなたなら、どちらを選ぶ？——「' + labels.map(escapeHtml).join('」／「') + '」'
+        : 'この回の判断は、まだ明かされていません。';
+      return '<div class="card teaser"><h2>' + escapeHtml(ep.title) + '</h2>' +
+        '<div class="teaser-q"><span class="qlabel">問い</span>' + question + '</div></div>';
+    }
+
+    // ⑩ 表示順の決定：来訪話（params.ep）があればそれを先頭、残りは新しい順（num降順）。
+    // ep が無い直接来訪／ep はあるが該当話が見つからない場合（META未登録・打ち間違い等）は、
+    // どちらも従来どおり model.episodes の並びのまま返す（仕様5＝旧挙動フォールバック。2026-08-25 バトー検分①②の修正）。
+    function orderEpisodes(episodes, visitedCode) {
+      if (!visitedCode) return { list: episodes, visitedCode: null };
+      var head = null, rest = [];
+      episodes.forEach(function (ep) {
+        if (!head && ep.code === visitedCode) head = ep; else rest.push(ep);
+      });
+      if (!head) return { list: episodes, visitedCode: null }; // 該当話なし＝並びも元のまま旧挙動へ
+      rest.sort(function (a, b) { return b.num - a.num; }); // 新しい順
+      return { list: [head].concat(rest), visitedCode: visitedCode };
+    }
+
+    function render(model, params) {
+      var app = document.getElementById('app');
+      var note = document.getElementById('note');
+      var cta = document.getElementById('cta');
+      if (!model || !model.updated) {
+        app.innerHTML = '<div class="empty">まだ結果データがありません（データ未同期）</div>';
+        note.innerHTML = '';
+        cta.innerHTML = '';
+        return;
+      }
+      if (!model.episodes || !model.episodes.length) {
+        app.innerHTML = '<div class="empty">表示できるアンケートがまだありません</div>';
+        note.innerHTML = '';
+        cta.innerHTML = '';
+        return;
+      }
+
+      var visitedCode = params && params.ep ? String(params.ep) : '';
+      var ordered = orderEpisodes(model.episodes, visitedCode);
+      var showAllAsResults = !ordered.visitedCode; // ep無し／該当話なし＝仕様5フォールバック（全話を結果表示）
+
+      app.innerHTML = ordered.list.map(function (ep) {
+        var isVisited = showAllAsResults || ep.code === ordered.visitedCode;
+        return isVisited ? resultCardHtml(ep) : teaserCardHtml(ep);
+      }).join('');
+
+      note.innerHTML = '集計は取得時点のものです。<br>最終更新：' + escapeHtml(String(model.updated).slice(0, 10));
+
+      // 仕様5：ep無しの直接来訪＝現行どおり（CTAは出さない＝挙動を変えない）
+      cta.innerHTML = ordered.visitedCode
+        ? '▶ バックナンバーは、メニュー「モノガタリ」から'
+        : '';
+    }
+
+    function showError(err) {
+      console.error('[liff_vote] load failed:', err);
+      document.getElementById('app').innerHTML =
+        '<div class="empty">結果を読み込めませんでした。<br>電波状況をご確認のうえ、もう一度お試しください。' +
+        '<button class="retry" onclick="location.reload()">再読み込み</button></div>';
+      document.getElementById('note').innerHTML = '';
+      document.getElementById('cta').innerHTML = '';
+    }
+
+    // ---- ⑥起動：記録も表示もこのロード1回で完結する ----
+    // 番犬（20秒）：どの経路も決着しない異常系でも「読み込み中」のまま放置しない
+    document.addEventListener('DOMContentLoaded', function () {
+      var params = resolveParams();
+      var settled = false;
+      var watchdog = setTimeout(function () {
+        if (!settled) showError(new Error('watchdog timeout'));
+      }, 20000);
+      loadModel(params)
+        .then(function (model) { settled = true; clearTimeout(watchdog); render(model, params); })
+        .catch(function (err) { settled = true; clearTimeout(watchdog); showError(err); });
+    });
+  </script>
+</body>
+</html>
